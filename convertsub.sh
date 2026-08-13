@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Version 1.0.6
+# Version 1.1.0
 
 MKVMERGE="/usr/bin/"
 JQ="/usr/bin/"
@@ -7,17 +7,18 @@ JQ="/usr/bin/"
 IFS=$'\n'
 
 # Check for required tools
-if ! command -v "$JQ"jq &> /dev/null; then
+if ! command -v "${JQ}jq" &> /dev/null; then
     echo "❌ jq could not be found. Please install it."
     exit 1
 fi
 
-if ! command -v "$MKVMERGE"mkvmerge &> /dev/null; then
+if ! command -v "${MKVMERGE}mkvmerge" &> /dev/null; then
     echo "❌ mkvmerge could not be found. Please install it."
     exit 1
 fi
 
 LOCKFILE="/tmp/convertsub.lock"
+ABORTFILE="/tmp/convertsub.abort"
 
 exec 9>"$LOCKFILE"
 echo "Waiting for convertsub lock..."
@@ -26,6 +27,37 @@ flock -w 1800 9 || {
     exit 1
 }
 echo "Acquired convertsub lock."
+
+# --- Abort handling ---
+cleanup() {
+    rm -f "$LOCKFILE" "$ABORTFILE"
+
+    # Kill watcher if still alive
+    if [[ -n "$WATCHER_PID" ]] && kill -0 "$WATCHER_PID" 2>/dev/null; then
+        kill "$WATCHER_PID" 2>/dev/null
+    fi
+
+    echo "🧹 Lockfile, abort flag, and watcher cleaned up."
+}
+trap 'echo "⚠️ Abort requested. Waiting for current remux to finish..."; echo "1" > "$ABORTFILE"' SIGINT SIGTERM
+trap cleanup EXIT
+
+# Background monitor for 'q' key
+(
+  while true; do
+    # If read fails (TTY closed), exit watcher cleanly
+    if ! read -r -n1 key < /dev/tty; then
+      break
+    fi
+
+    if [[ $key == "q" ]]; then
+      echo "⚠️ 'q' pressed. Will stop after current file."
+      echo "1" > "$ABORTFILE"
+      break
+    fi
+  done
+) &
+WATCHER_PID=$!
 
 # SDH detection
 is_sdh() {
@@ -74,9 +106,8 @@ process_file() {
     
     echo "🎬 Processing: $input_file"
 
-    local json=$("$MKVMERGE"mkvmerge -J "$input_file")
-
-    local tracks_json=$(echo "$json" | "$JQ"jq -c '.tracks[] | select(.type=="subtitles")')
+    local json=$("${MKVMERGE}mkvmerge" -J "$input_file")
+    local tracks_json=$(echo "$json" | "${JQ}jq" -c '.tracks[] | select(.type=="subtitles")')
 
     local tracks_to_keep=()
     local track_name_args=()
@@ -84,23 +115,20 @@ process_file() {
     while read -r track; do
         [[ -z "$track" ]] && continue
 
-        local id=$(echo "$track" | "$JQ"jq -r '.id')
-        local lang=$(echo "$track" | "$JQ"jq -r '.properties.language // "und"')
-        local title=$(echo "$track" | "$JQ"jq -r '.properties.track_name // ""')
-        local hearing=$(echo "$track" | "$JQ"jq -r '.properties.hearing_impaired // 0')
-        local forced=$(echo "$track" | "$JQ"jq -r '.properties.forced // 0')
+        local id=$(echo "$track" | "${JQ}jq" -r '.id')
+        local lang=$(echo "$track" | "${JQ}jq" -r '.properties.language // "und"')
+        local title=$(echo "$track" | "${JQ}jq" -r '.properties.track_name // ""')
+        local hearing=$(echo "$track" | "${JQ}jq" -r '.properties.hearing_impaired // 0')
+        local forced=$(echo "$track" | "${JQ}jq" -r '.properties.forced // 0')
 
-        # SDH detection → always remove
         if is_sdh "$title" "$hearing"; then
             echo "💬 SDH detected on track ID $id → removing"
             continue
         fi
 
-        # SDH-only mode → keep everything except SDH
         if [[ "$SDH_ONLY" -eq 1 ]]; then
             tracks_to_keep+=("$id")
         else
-            # Normal mode → remove non-English
             if [[ "$lang" != "en" && "$lang" != "eng" && "$lang" != "und" ]]; then
                 echo "🧹 Removing non-English subtitle track ID $id ($lang)"
                 continue
@@ -108,28 +136,17 @@ process_file() {
             tracks_to_keep+=("$id")
         fi
 
-        # -------------------------------
-        # Track renaming
-        # -------------------------------
         local nice_lang=$(normalize_lang "$lang")
-
-        # Clean title
         title=$(echo "$title" | sed 's/[Ss]ubtitle//g; s/[Pp][Gg][Ss]//g; s/[Ss]ub//g; s/default//g' | xargs)
-
-        # Build new title
         local new_title="$nice_lang"
-
         [[ "$forced" == "1" ]] && new_title="$new_title (Forced)"
-
-        # Apply rename
         track_name_args+=("--track-name" "$id:$new_title")
 
     done <<< "$tracks_json"
 
     echo "📌 Tracks to keep (IDs): ${tracks_to_keep[*]}"
 
-    # NEW: detect if nothing changed
-    local original_ids=($(echo "$tracks_json" | "$JQ"jq -r '.id'))
+    local original_ids=($(echo "$tracks_json" | "${JQ}jq" -r '.id'))
     if [[ "${original_ids[*]}" == "${tracks_to_keep[*]}" ]]; then
         echo "ℹ️ No subtitle changes needed — skipping mux."
         return
@@ -148,7 +165,7 @@ process_file() {
         keep_args=(--no-subtitles)
     fi
 
-    "$MKVMERGE"mkvmerge -o "$output_file" \
+    "${MKVMERGE}mkvmerge" -o "$output_file" \
         "${keep_args[@]}" \
         "${track_name_args[@]}" \
         "$input_file" || {
@@ -177,8 +194,19 @@ if [ ! -d "$dir" ]; then
   exit
 fi
 
-find "$dir" -type f -name "*.mkv" | while read -r file; do
+# Lazy iteration over files
+while IFS= read -r file; do
+    if [[ -f "$ABORTFILE" ]]; then
+        echo "🛑 Aborting before processing $file"
+        break
+    fi
+
     process_file "$file"
-done
+
+    if [[ -f "$ABORTFILE" ]]; then
+        echo "🛑 Aborting after finishing $file"
+        break
+    fi
+done < <(find "$dir" -type f -name "*.mkv")
 
 unset IFS
