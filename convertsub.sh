@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Version 1.1.0
+# Version 1.2.2
 
 MKVMERGE="/usr/bin/"
+MKVPROPEDIT="/usr/bin/mkvpropedit"
 JQ="/usr/bin/"
 
 IFS=$'\n'
 
-# Check for required tools
 if ! command -v "${JQ}jq" &> /dev/null; then
     echo "❌ jq could not be found. Please install it."
     exit 1
@@ -14,6 +14,11 @@ fi
 
 if ! command -v "${MKVMERGE}mkvmerge" &> /dev/null; then
     echo "❌ mkvmerge could not be found. Please install it."
+    exit 1
+fi
+
+if [[ ! -x "$MKVPROPEDIT" ]]; then
+    echo "❌ mkvpropedit could not be found at $MKVPROPEDIT"
     exit 1
 fi
 
@@ -28,38 +33,31 @@ flock -w 1800 9 || {
 }
 echo "Acquired convertsub lock."
 
-# --- Abort handling ---
 cleanup() {
     rm -f "$LOCKFILE" "$ABORTFILE"
-
-    # Kill watcher if still alive
     if [[ -n "$WATCHER_PID" ]] && kill -0 "$WATCHER_PID" 2>/dev/null; then
         kill "$WATCHER_PID" 2>/dev/null
     fi
-
     echo "🧹 Lockfile, abort flag, and watcher cleaned up."
 }
+
 trap 'echo "⚠️ Abort requested. Waiting for current remux to finish..."; echo "1" > "$ABORTFILE"' SIGINT SIGTERM
 trap cleanup EXIT
 
-# Background monitor for 'q' key
 (
-  while true; do
-    # If read fails (TTY closed), exit watcher cleanly
-    if ! read -r -n1 key < /dev/tty; then
-      break
-    fi
-
-    if [[ $key == "q" ]]; then
-      echo "⚠️ 'q' pressed. Will stop after current file."
-      echo "1" > "$ABORTFILE"
-      break
-    fi
-  done
+    while true; do
+        if ! read -r -n1 key < /dev/tty; then
+            break
+        fi
+        if [[ $key == "q" ]]; then
+            echo "⚠️ 'q' pressed. Will stop after current file."
+            echo "1" > "$ABORTFILE"
+            break
+        fi
+    done
 ) &
 WATCHER_PID=$!
 
-# SDH detection
 is_sdh() {
     local title="$1"
     local hearing="$2"
@@ -77,9 +75,13 @@ is_sdh() {
     return 1
 }
 
-# Language normalization
 normalize_lang() {
-    case "$1" in
+    local lang="$1"
+
+    # Use the base language from BCP 47-style tags such as en-US or khk-Cyrl.
+    lang="${lang%%[-_]*}"
+
+    case "$lang" in
         en|eng) echo "English" ;;
         ja|jpn) echo "Japanese" ;;
         zh|zho|chi) echo "Chinese" ;;
@@ -94,7 +96,6 @@ normalize_lang() {
     esac
 }
 
-# SDH-only mode
 SDH_ONLY=0
 if [[ "$1" == "--sdh" ]]; then
     SDH_ONLY=1
@@ -103,98 +104,205 @@ fi
 
 process_file() {
     local input_file="$1"
-    
+
     echo "🎬 Processing: $input_file"
 
-    local json=$("${MKVMERGE}mkvmerge" -J "$input_file")
-    local tracks_json=$(echo "$json" | "${JQ}jq" -c '.tracks[] | select(.type=="subtitles")')
+    local json
+    json=$("${MKVMERGE}mkvmerge" -J "$input_file") || {
+        echo "⚠️ Error reading file: $input_file"
+        return 1
+    }
+
+    local tracks_json
+    tracks_json=$(echo "$json" | "${JQ}jq" -c '.tracks[] | select(.type=="subtitles")')
 
     local tracks_to_keep=()
+    local original_ids=()
+
+    local subtitle_ordinal=0
+
     local track_name_args=()
+    local propedit_args=()
+
+    local tracks_removed=0
+    local metadata_changed=0
 
     while read -r track; do
         [[ -z "$track" ]] && continue
 
-        local id=$(echo "$track" | "${JQ}jq" -r '.id')
-        local lang=$(echo "$track" | "${JQ}jq" -r '.properties.language // "und"')
-        local title=$(echo "$track" | "${JQ}jq" -r '.properties.track_name // ""')
-        local hearing=$(echo "$track" | "${JQ}jq" -r '.properties.hearing_impaired // 0')
-        local forced=$(echo "$track" | "${JQ}jq" -r '.properties.forced // 0')
+        local id
+        local lang
+        local lang_base
+        local title
+        local hearing
+        local forced
+
+        id=$(echo "$track" | "${JQ}jq" -r '.id')
+
+        # Prefer the IETF language tag when present.
+        # This prevents tracks such as:
+        #   language=und, language_ietf=khk-Cyrl
+        # from incorrectly being treated as undefined.
+        lang=$(echo "$track" | "${JQ}jq" -r '
+            .properties.language_ietf //
+            .properties.language //
+            "und"
+        ')
+
+        lang_base="${lang%%[-_]*}"
+
+        title=$(echo "$track" | "${JQ}jq" -r '.properties.track_name // ""')
+        hearing=$(echo "$track" | "${JQ}jq" -r '.properties.hearing_impaired // 0')
+        forced=$(echo "$track" | "${JQ}jq" -r '.properties.forced // 0')
+
+        original_ids+=("$id")
+
+        local propedit_track=$((subtitle_ordinal + 1))
+        ((subtitle_ordinal++))
 
         if is_sdh "$title" "$hearing"; then
             echo "💬 SDH detected on track ID $id → removing"
+            tracks_removed=1
             continue
         fi
 
         if [[ "$SDH_ONLY" -eq 1 ]]; then
             tracks_to_keep+=("$id")
         else
-            if [[ "$lang" != "en" && "$lang" != "eng" && "$lang" != "und" ]]; then
+            if [[ "$lang_base" != "en" &&
+                  "$lang_base" != "eng" &&
+                  "$lang_base" != "und" ]]; then
                 echo "🧹 Removing non-English subtitle track ID $id ($lang)"
+                tracks_removed=1
                 continue
             fi
+
             tracks_to_keep+=("$id")
         fi
 
-        local nice_lang=$(normalize_lang "$lang")
-        title=$(echo "$title" | sed 's/[Ss]ubtitle//g; s/[Pp][Gg][Ss]//g; s/[Ss]ub//g; s/default//g' | xargs)
-        local new_title="$nice_lang"
-        [[ "$forced" == "1" ]] && new_title="$new_title (Forced)"
-        track_name_args+=("--track-name" "$id:$new_title")
+        local nice_lang
+        nice_lang=$(normalize_lang "$lang")
 
+        title=$(echo "$title" |
+            sed 's/[Ss]ubtitle//g; s/[Pp][Gg][Ss]//g; s/[Ss]ub//g; s/default//g' |
+            xargs)
+
+        local old_title="$title"
+        local new_title
+
+        if [[ "$old_title" =~ [Cc]ommentary|[Dd]irector|[Cc]ast|[Pp]roducer|[Ww]riter ]]; then
+            local commentary_label="Commentary"
+
+            [[ "$old_title" =~ [Dd]irector ]] && commentary_label="Director Commentary"
+            [[ "$old_title" =~ [Cc]ast ]] && commentary_label="Cast Commentary"
+            [[ "$old_title" =~ [Pp]roducer ]] && commentary_label="Producer Commentary"
+            [[ "$old_title" =~ [Ww]riter ]] && commentary_label="Writer Commentary"
+
+            new_title="$nice_lang $commentary_label"
+        else
+            new_title="$nice_lang"
+        fi
+
+        [[ "$forced" == "1" ]] && new_title="$new_title (Forced)"
+
+        if [[ "$title" != "$new_title" ]]; then
+            echo "🏷️  Subtitle track ID $id title -> \"$new_title\""
+
+            track_name_args+=(
+                "--track-name"
+                "$id:$new_title"
+            )
+
+            propedit_args+=(
+                --edit "track:s$propedit_track"
+                --set "name=$new_title"
+            )
+
+            metadata_changed=1
+        fi
     done <<< "$tracks_json"
 
     echo "📌 Tracks to keep (IDs): ${tracks_to_keep[*]}"
 
-    local original_ids=($(echo "$tracks_json" | "${JQ}jq" -r '.id'))
-    if [[ "${original_ids[*]}" == "${tracks_to_keep[*]}" ]]; then
+    if [[ -z "$tracks_json" ]]; then
+        echo "ℹ️ No subtitle tracks found — skipping."
+        return 0
+    fi
+
+    if (( tracks_removed == 1 )); then
+        if [[ ${#tracks_to_keep[@]} -eq 0 ]]; then
+            echo "🧹 No subtitle tracks remain after filtering - muxing file with no subtitles."
+        fi
+
+        local output_file="${input_file%.mkv}-no-subtitles.mkv"
+
+        local keep_args=()
+
+        if [[ ${#tracks_to_keep[@]} -gt 0 ]]; then
+            keep_args=(
+                --subtitle-tracks
+                "$(IFS=,; echo "${tracks_to_keep[*]}")"
+            )
+        else
+            keep_args=(--no-subtitles)
+        fi
+
+        echo "🔄 Subtitle removal requires a remux..."
+
+        "${MKVMERGE}mkvmerge" -o "$output_file" \
+            "${keep_args[@]}" \
+            "${track_name_args[@]}" \
+            "$input_file" || {
+            echo "⚠️ Error processing file: $input_file"
+            rm -f "$output_file"
+            return 1
+        }
+
+        if [[ -f "$output_file" ]]; then
+            mv -f "$output_file" "$input_file"
+            echo "✅ Successfully updated file: $input_file"
+        else
+            echo "⚠️ Error: New file was not created."
+            return 1
+        fi
+
+    elif (( metadata_changed == 1 )); then
+        echo "🏷️ Updating subtitle metadata in place..."
+
+        "${MKVPROPEDIT}" \
+            "$input_file" \
+            "${propedit_args[@]}"
+
+        local result=$?
+
+        if [[ "$result" -eq 0 ]]; then
+            echo "✅ Subtitle metadata updated in place: $input_file"
+        elif [[ "$result" -eq 1 ]]; then
+            echo "⚠️ Subtitle metadata updated with warnings: $input_file"
+        else
+            echo "❌ Error updating subtitle metadata: $input_file"
+            return 1
+        fi
+
+    else
         echo "ℹ️ No subtitle changes needed — skipping mux."
-        return
     fi
 
-    if [[ ${#tracks_to_keep[@]} -eq 0 ]]; then
-        echo "🧹 No subtitle tracks remain after filtering - muxing file with no subtitles."
-    fi
-
-    local output_file="${input_file%.mkv}-no-subtitles.mkv"
-    
-    local keep_args=()
-    if [[ ${#tracks_to_keep[@]} -gt 0 ]]; then
-        keep_args=(--subtitle-tracks "$(IFS=,; echo "${tracks_to_keep[*]}")")
-    else
-        keep_args=(--no-subtitles)
-    fi
-
-    "${MKVMERGE}mkvmerge" -o "$output_file" \
-        "${keep_args[@]}" \
-        "${track_name_args[@]}" \
-        "$input_file" || {
-        echo "⚠️ Error processing file: $input_file"
-        return 1
-    }
-
-    if [[ -f "$output_file" ]]; then
-        mv "$output_file" "$input_file"
-        echo "✅ Successfully updated file: $input_file"
-    else
-        echo "⚠️ Error: New file was not created."
-        return 1
-    fi
+    return 0
 }
 
 if [ -n "$1" ]; then
-  dir="$1"
+    dir="$1"
 else
-  echo "⚠️ Please call the script with a trailing directory part to process."
-  exit 0
+    echo "⚠️ Please call the script with a trailing directory part to process."
+    exit 0
 fi
 
 if [ ! -d "$dir" ]; then
-  echo "❌ Directory doesn't exist, aborting."
-  exit
+    echo "❌ Directory doesn't exist, aborting."
+    exit 1
 fi
 
-# Lazy iteration over files
 while IFS= read -r file; do
     if [[ -f "$ABORTFILE" ]]; then
         echo "🛑 Aborting before processing $file"
