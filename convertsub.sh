@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
-# Version 1.2.2
+# Version 1.2.3
 
 MKVMERGE="/usr/bin/"
 MKVPROPEDIT="/usr/bin/mkvpropedit"
 JQ="/usr/bin/"
+
+clear
 
 IFS=$'\n'
 
